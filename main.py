@@ -1,109 +1,228 @@
 from fasthtml.common import *
 import random
+import asyncio
+from collections import deque
+from datetime import datetime
 
-# Create FastHTML app and route decorator for URL path handling
-app, rt = fast_app()
+# Create FastHTML app with WebSocket extension
+app, rt = fast_app(exts='ws')
+
+
+class AppState:
+    """Global application state, keeping track of numbers and WebSocket connections"""
+    def __init__(self):
+        self.global_numbers = deque(maxlen=100)
+        self.websockets = set()
+
+    async def broadcast(self, number):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        message = Ul(
+            Li(
+                Div(f"Number: {number}"),
+                Div(timestamp, cls="timestamp"),
+                cls="number-item"
+            ),
+            id="global-numbers-list",
+            hx_swap_oob="beforeend"
+        )
+
+        for ws in self.websockets.copy():
+            try:
+                await ws(message)
+            except:
+                self.websockets.remove(ws)
+
+
+state = AppState()
 
 
 @rt("/")
-def get(session):
-    # Initialize empty numbers list in session if not present to ensure valid state
-    if 'numbers' not in session:
-        session['numbers'] = []
-
-    return Titled("Number Collection",  # Page title for browser tab and main heading
+def get():
+    """Main page layout"""
+    return Titled("Number Collection",
+                  Style("""
+            .numbers-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 20px;
+                margin-top: 20px;
+            }
+            .number-section {
+                padding: 15px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                background: white;
+            }
+            .numbers-list {
+                max-height: 400px;
+                overflow-y: auto;
+            }
+            .number-item {
+                padding: 8px;
+                margin: 4px 0;
+                background: #f5f5f5;
+                border-radius: 4px;
+            }
+            .controls {
+                margin-bottom: 20px;
+            }
+            .timestamp {
+                font-size: 0.8em;
+                color: #666;
+            }
+        """),
                   Container(
-                      Form(
-                          Group(
-                              Input(
-                                  type="number",
-                                  id="number-input",
-                                  name="number",
-                                  placeholder="Enter a number",
-                                  required=True  # Prevents form submission without a value
+                      # Input controls
+                      Div(
+                          Form(
+                              Group(
+                                  Input(
+                                      type="number",
+                                      id="number-input",
+                                      name="number",
+                                      placeholder="Enter a number",
+                                      required=True
+                                  ),
+                                  Button("Confirm", type="submit")
                               ),
-                              Button("Confirm", type="submit")
-                          ),
-                          hx_post="/add-number",  # HTMX will POST to this endpoint on form submit
-                          hx_target="#numbers-list",  # Target element that will receive the response
-                          hx_swap="beforeend"  # New items will be appended to the end of target
-                      ),
-
-                      # Two buttons on a single line
-                      Group(
-                          # Button that generates and adds random numbers to the list
-                          Button(
-                              "Add Random Number",
-                              hx_post="/add-random-number",  # Different endpoint but same HTMX pattern as form
-                              hx_target="#numbers-list",
+                              hx_post="/add-number",
+                              hx_target="#local-numbers-list",
                               hx_swap="beforeend"
                           ),
-                          # Button which clears the list of stored numbers
-                          Button(
-                              "Clear Numbers",
-                              hx_post="/clear-numbers",  # Endpoint to clear stored numbers
-                              hx_target="#numbers-list",  # Target to clear the list on the client side
-                              hx_swap="outerHTML"  # Replace the entire list with empty list
+                          Group(
+                              Button(
+                                  "Add Random Number",
+                                  hx_post="/add-random-number",
+                                  hx_target="#local-numbers-list",
+                                  hx_swap="beforeend"
+                              ),
                           ),
+                          cls="controls"
                       ),
 
-                      H2("Stored Numbers:"),
-                      # Show a list with stored numbers on the left and a graph on the right
-                      Group(
-
+                      # Grid for local and global numbers
                       Div(
-                          # Create list with stored numbers, giving it an ID for HTMX targeting
-                          Ul(
-                              *[Li(str(num)) for num in session.get('numbers', [])],
-                              id="numbers-list"
-                          )
-                      ),
-                    Div(
-                        # Placeholder for a graph showing the distribution of stored numbers
-                        "Graph placeholder",
-                        style="border: 1px solid black; height: 200px; width: 200px; margin-left: 10px;"
-                    ),
+                          # Left side - Local numbers
+                          Div(
+                              H2("Local Generated Numbers"),
+                              Ul(
+                                  id="local-numbers-list",
+                                  cls="numbers-list"
+                              ),
+                              cls="number-section"
+                          ),
 
+                          # Right side - Global numbers
+                          Div(
+                              H2("Global Numbers (All Instances)"),
+                              Div(
+                                  Ul(
+                                      *[Li(
+                                          Div(f"Number: {num}"),
+                                          Div(datetime.now().strftime("%H:%M:%S"), cls="timestamp"),
+                                          cls="number-item"
+                                      ) for num in state.global_numbers],
+                                      id="global-numbers-list",
+                                      cls="numbers-list"
+                                  ),
+                                  hx_ext="ws",
+                                  ws_connect="/ws"
+                              ),
+                              cls="number-section"
+                          ),
+                          cls="numbers-grid"
+                      )
                   )
-                )
-                )
+                  )
+
+
+async def on_connect(send):
+    """Handle new WebSocket connections"""
+    state.websockets.add(send)
+    message = Li(
+        Div("Connected to number stream"),
+        Div(datetime.now().strftime("%H:%M:%S"), cls="timestamp"),
+        cls="number-item"
+    )
+    await send(message)
+
+
+async def on_disconnect(ws):
+    """Handle WebSocket disconnections"""
+    if ws in state.websockets:
+        state.websockets.remove(ws)
+
+
+@app.ws('/ws', conn=on_connect, disconn=on_disconnect)
+async def ws(msg: str, send):
+    """WebSocket endpoint"""
+    pass
 
 
 @rt("/add-number")
-def post(session, number: float = None):
-    # Return early if no valid number was provided in the form
+async def post(number: float = None):
+    """Add a number to the local and the global state by broadcasting it to all"""
     if number is None:
-        return "Invalid input"
+        return "Invalid input: Number is required"
 
-    # Store the new number in session and get current list
-    numbers = session.get('numbers', [])
-    numbers.append(number)
-    session['numbers'] = numbers
+    # Check if number is actually a float
+    if not isinstance(number, (float, int)):
+        return f"Invalid input: Must be a number instead got '{number}'"
 
-    # Return single new list item for HTMX to append to existing list
-    return Li(str(number))
+    # Define bounds (adjust these as needed)
+    MIN_VALUE = 0.0
+    MAX_VALUE = 100.0
+
+    # Check if number is within bounds
+    if not MIN_VALUE <= number <= MAX_VALUE:
+        return f"Invalid input: Number must be between {MIN_VALUE} and {MAX_VALUE}"
+    # Update global state and broadcast
+    state.global_numbers.appendleft(number)
+    await state.broadcast(number)
+
+    # Return only the local number update
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    return Li(
+        Div(f"Number: {number}"),
+        Div(timestamp, cls="timestamp"),
+        cls="number-item"
+    )
 
 
 @rt("/add-random-number")
-def post(session):
-    # Generate random number between -10000-10000 and add to session storage
+async def post():
+    """Add a random number to the local and the global state by broadcasting it to all"""
     random_num = random.uniform(-10000, 10000)
-    numbers = session.get('numbers', [])
-    numbers.append(random_num)
-    session['numbers'] = numbers
 
-    # Return just the new random number as a list item for HTMX append
-    return Li(str(random_num))
+    # Update global state and broadcast
+    state.global_numbers.appendleft(random_num)
+    await state.broadcast(random_num)
 
-
-@rt("/clear-numbers")
-def post(session):
-    # Clear the stored numbers list in session
-    session['numbers'] = []
-
-    # Return a new empty list instead of empty string to maintain DOM structure
-    return Ul(id="numbers-list")
+    # Return only the local number update
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    return Li(
+        Div(f"Number: {random_num}"),
+        Div(timestamp, cls="timestamp"),
+        cls="number-item"
+    )
 
 
-# Start the FastHTML development server
 serve()
+
+# def validate_number(number):
+#     if number is None:
+#         return "Invalid input: Number is required"
+#
+#     # Check if number is actually a float
+#     try:
+#         number = float(number)
+#     except (ValueError, TypeError):
+#         return "Invalid input: Must be a number"
+#
+#     # Define bounds (adjust these as needed)
+#     MIN_VALUE = 0.0
+#     MAX_VALUE = 100.0
+#
+#     # Check if number is within bounds
+#     if not MIN_VALUE <= number <= MAX_VALUE:
+#         return f"Invalid input: Number must be between {MIN_VALUE} and {MAX_VALUE}"
